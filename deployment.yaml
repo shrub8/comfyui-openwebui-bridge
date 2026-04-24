@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comfyui-proxy
+  namespace: open-webui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: comfyui-proxy
+  template:
+    metadata:
+      labels:
+        app: comfyui-proxy
+    spec:
+      containers:
+      - name: comfyui-bridge
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8188
+        env:
+        - name: COMFYUI_CLOUD_URL
+          value: "https://cloud.comfy.org"
+        - name: COMFYUI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: comfyui-secret
+              key: api-key
+        - name: POLL_INTERVAL_SECONDS
+          value: "2"
+        - name: POLL_TIMEOUT_SECONDS
+          value: "300"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          pip install fastapi uvicorn[standard] httpx -q
+          cd /app
+          uvicorn main:app --host 0.0.0.0 --port 8188
+        volumeMounts:
+        - name: bridge-script
+          mountPath: /app
+      volumes:
+      - name: bridge-script
+        configMap:
+          name: comfyui-bridge-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: comfyui-proxy
+  namespace: open-webui
+spec:
+  selector:
+    app: comfyui-proxy
+  ports:
+  - port: 8188
+    targetPort: 8188
