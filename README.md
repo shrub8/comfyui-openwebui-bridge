@@ -23,9 +23,11 @@ This bridge sits between Open WebUI and ComfyUI Cloud, translating:
 | Open WebUI Expects | Bridge Provides | Cloud Actually Has |
 |-------------------|-----------------|-------------------|
 | WebSocket `/ws` | Accepts WS, polls cloud internally | `GET /api/job/{id}/status` |
+| `POST /prompt` | Forwards with `X-API-Key` | `POST /api/prompt` |
 | `GET /history/{id}` | Queries `/api/jobs`, returns synthetic history | `GET /api/jobs` (list) |
-| `GET /view?filename=...` | Proxies to cloud with auth | `GET /api/view` (with hashed names) |
-| `Authorization: Bearer` | Ignored (bridge uses its own key) | `X-API-Key` header |
+| `GET /view?filename=...` | Proxies to cloud with auth, follows 302 | `GET /api/view` (with hashed names) |
+| `GET /object_info`, `/system_stats`, `/queue` | Proxied with `X-API-Key` | `/api/*` equivalents |
+| `Authorization: Bearer` (ignored) | Bridge uses its own `X-API-Key` | `X-API-Key` header |
 
 ## Architecture
 
@@ -44,13 +46,14 @@ Open WebUI → Bridge (this app) → ComfyUI Cloud
 ```bash
 # Create secret for API key (DO NOT commit this file with real keys)
 kubectl create secret generic comfyui-secret \
+  --namespace=open-webui \
   --from-literal=api-key=YOUR_COMFYUI_CLOUD_API_KEY
 
 # Apply the deployment
 kubectl apply -f deployment.yaml
 ```
 
-See `deployment.yaml` for full Kubernetes manifest.
+See `deployment.yaml` for the full Kubernetes manifest.
 
 ### Docker
 
@@ -68,18 +71,27 @@ docker run -e COMFYUI_API_KEY=YOUR_KEY -p 8188:8188 comfyui-bridge
 | `POLL_INTERVAL_SECONDS` | No | `2.0` | How often to poll job status |
 | `POLL_TIMEOUT_SECONDS` | No | `300.0` | Max time to wait for job completion |
 
+## Open WebUI Configuration
+
+In Open WebUI Admin Settings → Images:
+
+- **Image Generation Engine:** `ComfyUI`
+- **ComfyUI Base URL:** `http://comfyui-proxy.open-webui.svc.cluster.local:8188` (or wherever you deployed the bridge)
+- **ComfyUI API Key:** Any non-empty string (the bridge ignores this — it uses its own `COMFYUI_API_KEY` env var)
+- **ComfyUI Workflow:** Your standard workflow JSON (e.g. Qwen-Image, SDXL, etc.)
+
 ## How It Works
 
 ### 1. Prompt Submission
 
 Open WebUI sends workflow JSON to `POST /prompt`.
-Bridge forwards to `POST /api/prompt` on ComfyUI Cloud.
-Cloud returns a `prompt_id` which the bridge tracks.
+Bridge forwards to `POST /api/prompt` on ComfyUI Cloud with the `X-API-Key` header.
+Cloud returns a `prompt_id` which the bridge tracks in `app.state.pending_prompts`.
 
 ### 2. Completion Detection
 
 Open WebUI connects to WebSocket `/ws`.
-Bridge starts a background task that polls `GET /api/job/{prompt_id}/status` every 2 seconds.
+Bridge starts polling `GET /api/job/{prompt_id}/status` every 2 seconds.
 When status is `success` (or `completed`/`done`), bridge sends fake WebSocket messages:
 
 ```json
@@ -89,14 +101,7 @@ When status is `success` (or `completed`/`done`), bridge sends fake WebSocket me
 
 These are the exact messages Open WebUI waits for to know generation is complete.
 
-### WebSocket Handler Design
-
-The WebSocket handler uses a dual-task architecture to avoid ASGI state confusion:
-
-1. **Receive drain task** (background) — continuously drains any messages from the client. This keeps the WebSocket responsive and detects real disconnects via `WebSocketDisconnect`.
-2. **Main poll loop** — watches `app.state.pending_prompts` for new prompts and drives the poll-and-notify flow directly.
-
-This design was critical to fix a bug where `receive_text(timeout=1.0)` in the main loop was causing uvicorn/starlette to mark the connection as "response already completed", resulting in all subsequent `send_json` calls failing after the first successful image.
+During execution, `progress` messages are sent periodically to keep the WebSocket alive.
 
 ### 3. History Lookup
 
@@ -119,18 +124,32 @@ ComfyUI Cloud doesn't have `/history/`. The bridge queries `GET /api/jobs`, find
 
 Open WebUI requests `GET /view?filename=...&type=output`.
 Bridge proxies this to `GET /api/view` on ComfyUI Cloud with the `X-API-Key` header.
-Follows 302 redirects if needed.
+Follows 302 redirects (ComfyUI Cloud redirects to a signed Google Cloud Storage URL).
+
+## WebSocket Handler Design
+
+The WebSocket handler uses a dual-task architecture to avoid ASGI state confusion:
+
+1. **Receive drain task** (background) — continuously drains any messages from the client. This keeps the WebSocket responsive and detects real disconnects via `WebSocketDisconnect`.
+2. **Main poll loop** — watches `app.state.pending_prompts` for new prompts and drives the poll-and-notify flow directly. Never calls `receive_*` itself.
+
+This design fixed a subtle bug: the earlier version used `receive_text(timeout=1.0)` in the main loop to check for pending prompts. That timeout caused uvicorn/starlette to mark the connection as "response already completed", so every `send_json` after the first poll failed with:
+
+```
+Unexpected ASGI message 'websocket.send', after sending 'websocket.close' or response already completed.
+```
+
+The first image in a chat would still work (fresh connection state), but every subsequent image would show stale content because the completion events never reached Open WebUI. Splitting receive and send into separate tasks resolved this.
 
 ## Security Considerations
 
 ### Secrets Management
 
-**Current approach (Kubernetes):**
+**Kubernetes (recommended):**
 - API key stored in Kubernetes Secret (`comfyui-secret`)
 - Mounted as env var via `secretKeyRef` in Deployment
 - Never committed to Git
 
-**For GitHub repo:**
 ```yaml
 # deployment.yaml (safe to commit)
 env:
@@ -144,19 +163,19 @@ env:
 ```bash
 # Create secret locally (DO NOT commit this)
 kubectl create secret generic comfyui-secret \
+  --namespace=open-webui \
   --from-literal=api-key=YOUR_ACTUAL_KEY
 ```
 
-### Other Secrets in the Cluster
+### Network Exposure
 
-The bridge only needs `COMFYUI_API_KEY`. Other secrets in the `open-webui` namespace:
-- `webui-tls` — TLS certificate (managed by cert-manager)
-- `comfyui-secret` — This API key
+The bridge should be **internal-only** (no public ingress). It should only be reachable from Open WebUI inside the cluster. Exposing it publicly would effectively expose your ComfyUI Cloud API key behind a thin proxy.
 
 ## Development
 
 ```bash
-pip install fastapi uvicorn[standard] httpx
+pip install fastapi 'uvicorn[standard]' httpx
+export COMFYUI_API_KEY=your-key-here
 uvicorn main:app --reload --port 8188
 ```
 
@@ -164,7 +183,7 @@ uvicorn main:app --reload --port 8188
 
 - `main.py` — FastAPI bridge application
 - `Dockerfile` — Container build
-- `deployment.yaml` — Kubernetes manifest
+- `deployment.yaml` — Kubernetes Deployment + Service
 - `secret-example.yaml` — Example secret manifest (replace with real key)
 - `README.md` — This file
 
