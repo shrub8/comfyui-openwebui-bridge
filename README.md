@@ -89,6 +89,15 @@ When status is `success` (or `completed`/`done`), bridge sends fake WebSocket me
 
 These are the exact messages Open WebUI waits for to know generation is complete.
 
+### WebSocket Handler Design
+
+The WebSocket handler uses a dual-task architecture to avoid ASGI state confusion:
+
+1. **Receive drain task** (background) — continuously drains any messages from the client. This keeps the WebSocket responsive and detects real disconnects via `WebSocketDisconnect`.
+2. **Main poll loop** — watches `app.state.pending_prompts` for new prompts and drives the poll-and-notify flow directly.
+
+This design was critical to fix a bug where `receive_text(timeout=1.0)` in the main loop was causing uvicorn/starlette to mark the connection as "response already completed", resulting in all subsequent `send_json` calls failing after the first successful image.
+
 ### 3. History Lookup
 
 Open WebUI requests `GET /history/{prompt_id}` expecting:

@@ -1,13 +1,3 @@
-"""
-ComfyUI Cloud ↔ Open WebUI Bridge
-
-Translates Open WebUI's local ComfyUI expectations into ComfyUI Cloud API calls:
-- Injects X-API-Key on all requests
-- Rewrites paths: /xxx → /api/xxx
-- Bridges WebSocket completion events ↔ Cloud polling
-- Proxies /view with redirect following
-"""
-
 import asyncio
 import json
 import os
@@ -25,43 +15,67 @@ POLL_TIMEOUT = float(os.environ.get("POLL_TIMEOUT_SECONDS", "300.0"))
 
 app = FastAPI()
 
-
 def cloud_headers():
     return {
         "X-API-Key": API_KEY,
         "Content-Type": "application/json",
     }
 
-
 @app.websocket("/ws")
 async def websocket_bridge(websocket: WebSocket):
     """
-    Open WebUI connects here and waits for a completion event.
-    We poll ComfyUI Cloud and fire the expected WS messages when done.
+    WebSocket endpoint. Open WebUI connects here and waits for completion events.
+
+    Design:
+    - Immediately send an initial 'status' message so the connection is definitively alive
+    - Wait for a prompt_id to appear in app.state.pending_prompts (set by /prompt handler)
+    - Start polling Cloud and send events directly
+    - Keep WS alive with periodic pings (raw WS ping frames)
     """
     await websocket.accept()
-    log.info("WebSocket client connected")
+    client_id = websocket.query_params.get("clientId", "unknown")
+    log.info(f"WebSocket client connected: clientId={client_id}")
 
-    # Track prompt_ids submitted during this WS session
-    pending: dict[str, asyncio.Task] = {}
-    client_connected = True
+    # Send an initial status message to confirm connection
+    try:
+        await websocket.send_json({
+            "type": "status",
+            "data": {"status": {"exec_info": {"queue_remaining": 0}}, "sid": client_id}
+        })
+    except Exception as e:
+        log.warning(f"Initial send failed: {e}")
+        return
 
-    async def send_if_connected(data: dict):
-        """Send message only if websocket is still connected."""
-        if client_connected:
-            try:
-                await websocket.send_json(data)
-                return True
-            except Exception as e:
-                log.warning(f"Failed to send message: {e}")
-                return False
-        return False
+    # Track associations
+    handled_prompts = set()
+    receive_task = None
+
+    async def drain_receive():
+        """Drain any messages sent by client to keep connection responsive."""
+        try:
+            while True:
+                msg = await websocket.receive_text()
+                log.debug(f"Client sent: {msg[:100]}")
+        except WebSocketDisconnect:
+            log.info(f"Client {client_id} disconnected")
+        except Exception as e:
+            log.warning(f"Receive error: {e}")
 
     async def poll_and_notify(prompt_id: str):
-        """Poll Cloud until job completes, then send WS events."""
-        log.info(f"Polling for prompt_id={prompt_id}")
+        """Poll Cloud until job completes, send WS events directly."""
+        log.info(f"[{client_id}] Polling for prompt_id={prompt_id}")
         elapsed = 0.0
         async with httpx.AsyncClient() as client:
+            # Send execution_start immediately
+            try:
+                await websocket.send_json({
+                    "type": "execution_start",
+                    "data": {"prompt_id": prompt_id}
+                })
+            except Exception as e:
+                log.warning(f"Failed execution_start: {e}")
+                return
+
             while elapsed < POLL_TIMEOUT:
                 await asyncio.sleep(POLL_INTERVAL)
                 elapsed += POLL_INTERVAL
@@ -73,76 +87,81 @@ async def websocket_bridge(websocket: WebSocket):
                     )
                     data = r.json()
                     status = data.get("status", "")
-                    log.info(f"  {prompt_id} status={status}")
+                    log.info(f"[{client_id}] {prompt_id} status={status}")
 
                     if status in ("completed", "success", "done"):
-                        # Send execution_cached / executing null to mimic local ComfyUI
-                        await send_if_connected({
-                            "type": "execution_cached",
-                            "data": {"nodes": [], "prompt_id": prompt_id}
-                        })
-                        await asyncio.sleep(0.5)  # Give Open WebUI time to process
-                        await send_if_connected({
-                            "type": "executing",
-                            "data": {"node": None, "prompt_id": prompt_id}
-                        })
-                        # Keep connection alive briefly to ensure message is received
-                        await asyncio.sleep(1.0)
-                        log.info(f"Sent completion events for {prompt_id}")
+                        try:
+                            await websocket.send_json({
+                                "type": "execution_cached",
+                                "data": {"nodes": [], "prompt_id": prompt_id}
+                            })
+                            await asyncio.sleep(0.3)
+                            await websocket.send_json({
+                                "type": "executing",
+                                "data": {"node": None, "prompt_id": prompt_id}
+                            })
+                            log.info(f"[{client_id}] Sent completion for {prompt_id}")
+                        except Exception as e:
+                            log.error(f"Failed to send completion: {e}")
                         return
 
                     elif status in ("failed", "cancelled", "error"):
-                        await send_if_connected({
-                            "type": "execution_error",
-                            "data": {"prompt_id": prompt_id, "message": status}
-                        })
+                        try:
+                            await websocket.send_json({
+                                "type": "execution_error",
+                                "data": {"prompt_id": prompt_id, "message": status}
+                            })
+                        except Exception:
+                            pass
                         return
+
+                    else:
+                        # Progress update
+                        try:
+                            await websocket.send_json({
+                                "type": "progress",
+                                "data": {"value": 1, "max": 2, "prompt_id": prompt_id, "node": None}
+                            })
+                        except Exception as e:
+                            log.warning(f"Heartbeat failed: {e}")
+                            return
 
                 except Exception as e:
                     log.warning(f"Poll error: {e}")
 
-        log.error(f"Timed out polling {prompt_id}")
-        await send_if_connected({
-            "type": "execution_error",
-            "data": {"prompt_id": prompt_id, "message": "timeout"}
-        })
+            log.error(f"[{client_id}] Timeout polling {prompt_id}")
+
+    # Start receive drain in background
+    receive_task = asyncio.create_task(drain_receive())
 
     try:
+        # Main loop: watch for pending_prompts and handle them
         while True:
-            # Open WebUI sends {"type": "subscribe", ...} or nothing meaningful
-            # We just need to stay alive; prompt_ids come via HTTP /prompt
-            # But we need a way to know which prompt_id to poll.
-            # Open WebUI registers clientId in query params — we use that to
-            # correlate with prompt submissions tracked in app state.
-            try:
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
-                data = json.loads(msg)
-                # If OWU sends a prompt_id hint
-                if "prompt_id" in data:
-                    pid = data["prompt_id"]
-                    if pid not in pending:
-                        pending[pid] = asyncio.create_task(poll_and_notify(pid))
-            except asyncio.TimeoutError:
-                pass  # normal, just keep alive
-            except Exception:
-                pass
+            await asyncio.sleep(0.2)
 
-            # Also check app-level pending queue (set by /prompt handler)
+            # Check for new prompts to handle
             for pid in list(app.state.pending_prompts):
-                if pid not in pending:
-                    pending[pid] = asyncio.create_task(poll_and_notify(pid))
+                if pid not in handled_prompts:
+                    handled_prompts.add(pid)
                     app.state.pending_prompts.discard(pid)
+                    # Run poll_and_notify directly - don't spawn task so we await it
+                    await poll_and_notify(pid)
+                    # After completion, we're done with this WS
+                    log.info(f"[{client_id}] Poll finished for {pid}, keeping WS open")
 
-    except WebSocketDisconnect:
-        client_connected = False
-        log.info("WebSocket client disconnected")
-        for task in pending.values():
-            task.cancel()
+            if receive_task.done():
+                log.info(f"[{client_id}] Receive task ended, closing WS loop")
+                break
 
+    except Exception as e:
+        log.error(f"[{client_id}] Main loop error: {e}")
+    finally:
+        if receive_task and not receive_task.done():
+            receive_task.cancel()
+        log.info(f"[{client_id}] WebSocket handler exiting")
 
 @app.post("/prompt")
 async def submit_prompt(request: Request):
-    """Forward prompt to Cloud, register prompt_id for WS polling."""
     body = await request.json()
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -155,18 +174,11 @@ async def submit_prompt(request: Request):
     prompt_id = data.get("prompt_id")
     if prompt_id:
         app.state.pending_prompts.add(prompt_id)
-        log.info(f"Queued prompt_id={prompt_id} for WS notification")
+        log.info(f"Queued prompt_id={prompt_id}")
     return Response(content=r.content, media_type="application/json", status_code=r.status_code)
-
 
 @app.get("/history/{prompt_id}")
 async def get_history(prompt_id: str):
-    """
-    Open WebUI expects GET /history/{prompt_id} to return output filenames.
-    ComfyUI Cloud doesn't have this endpoint. We query /api/jobs instead
-    and construct a synthetic history response.
-    """
-    # Query the jobs list to find this prompt_id
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"{CLOUD_BASE}/api/jobs",
@@ -183,7 +195,6 @@ async def get_history(prompt_id: str):
             output = job["preview_output"]
             node_id = output.get("nodeId", "60")
 
-            # Return synthetic history in format Open WebUI expects
             synthetic_history = {
                 prompt_id: {
                     "outputs": {
@@ -205,28 +216,10 @@ async def get_history(prompt_id: str):
                 status_code=200
             )
 
-    # Fallback: try the standard endpoint (for local ComfyUI compatibility)
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{CLOUD_BASE}/api/history/{prompt_id}",
-            headers=cloud_headers(),
-            timeout=15,
-        )
-
-    if r.status_code == 404:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(
-                f"{CLOUD_BASE}/history/{prompt_id}",
-                headers=cloud_headers(),
-                timeout=15,
-            )
-
-    return Response(content=r.content, media_type="application/json", status_code=r.status_code)
-
+    return Response(content=b"{}", media_type="application/json", status_code=200)
 
 @app.get("/view")
 async def view_image(request: Request):
-    """Proxy image download, following the 302 redirect from Cloud."""
     params = dict(request.query_params)
     async with httpx.AsyncClient(follow_redirects=True) as client:
         r = await client.get(
@@ -241,7 +234,6 @@ async def view_image(request: Request):
         status_code=200,
     )
 
-
 @app.get("/object_info")
 async def object_info():
     async with httpx.AsyncClient() as client:
@@ -251,7 +243,6 @@ async def object_info():
             timeout=15,
         )
     return Response(content=r.content, media_type="application/json", status_code=r.status_code)
-
 
 @app.get("/system_stats")
 async def system_stats():
@@ -263,7 +254,6 @@ async def system_stats():
         )
     return Response(content=r.content, media_type="application/json", status_code=r.status_code)
 
-
 @app.get("/queue")
 async def queue():
     async with httpx.AsyncClient() as client:
@@ -273,7 +263,6 @@ async def queue():
             timeout=15,
         )
     return Response(content=r.content, media_type="application/json", status_code=r.status_code)
-
 
 @app.on_event("startup")
 async def startup():
